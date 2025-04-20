@@ -1,0 +1,183 @@
+---
+title: "Virtual cohort-like simulations for adaptive therapy across model types"
+author: "Vibishan"
+date: "2024-10-09"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(psych)
+library(ggplot2)
+library(patchwork)
+# library(latex2exp)
+library(reticulate)
+setwd('/home/vibishan/csb/adaptive-therapy-with-transitions/codes/numerical-sims/')
+# library(lmerTest)
+# library(glmer)
+# use_python('/usr/bin/python3.12')
+# Sys.setenv(RETICULATE_PYTHON = "/usr/bin/python3")
+```
+
+```{r return-dominant-freq, message=FALSE, warning=FALSE}
+return_freq <- function(timeseries){
+  s <- spectrum(timeseries, plot = FALSE, method = 'ar')
+  s$freq[which.max(s$spec)]^-1
+}
+```
+
+```{python therapy-funs}
+import numpy as np
+import pandas as pd
+from scipy.integrate import ode
+import itertools as it
+from multiprocessing import Pool
+from scipy import stats
+import os
+
+def cell_eqns(t, y, g, inter_mat, tr, d_th):
+  K = 1e4 #Carrying capacity-common for both cell types
+  #Sensitive cell growth, density dependence, transitions from and to resistant cell state
+  dyS = g[0]*y[0]*(K - sum(y*inter_mat[0]))/K - tr[0]*y[0] + tr[1]*y[1] - d_th*y[0]
+  
+  #Resistant cell growth, density dependence, transitions from and to sensitive cell state
+  dyR = g[1]*y[1]*(K - sum(y*inter_mat[1]))/K + tr[0]*y[0] - tr[1]*y[1]
+  
+  return np.array([dyS, dyR])
+
+def sim_adaptive_therapy(parms_array):
+  t_max = 5000
+  dt = 1 #In hrs
+  t0 = 0
+  t = np.array([[t0]])
+  K = 1e4
+  g = parms_array[:2] #Intrinsic growth rate (/hr)
+  comp = parms_array[4:6] #Interaction coefficients
+  inter_mat = [[1, comp[0]], [comp[1], 1]] #Interaction matrix, assuming intra-specific interaction = 1
+  tr = parms_array[2:4] #Transition rates (/hr)
+  # tr = [0., 0.] #Transition rates (/hr)
+  
+  init_senfrac = parms_array[10]
+  init_popsize = parms_array[11]
+  y0 = [init_senfrac*init_popsize, (1-init_senfrac)*init_popsize]
+  y = np.array([y0]) #Cell number timeseries
+  y_t = y0
+  
+  f_ode = ode(cell_eqns).set_integrator('lsoda').set_initial_value(y0, t0).set_f_params(g, inter_mat, tr, 0) #Initialise system
+
+  # Therapy conditions
+  t_delay = 0 #Time delay for therapy
+  g_scale = parms_array[9]
+  g_th = g/[g_scale, 1.] #Growth rate under cytostatic therapy
+  tr_th = tr + [0., 0.] #Transition rate under therapy
+  d_th = parms_array[8] #Death rate for cytotoxic therapy
+  
+  run_params = np.concatenate([g, tr, comp, [t_delay, g_scale, d_th]]) #Pass current parameter values
+  
+  ts_therapy = np.array([False]) #Therapy status timeseries
+
+  t_on = False #Current therapy status
+
+  while f_ode.t < t_max:
+    
+    t=np.append(t, [[f_ode.t+dt]], axis=0)
+    y_t=f_ode.integrate(f_ode.t+dt)
+    # if f_ode.t >= t_delay:
+    if y_t.sum() > 0.5*K: #Threshold for adaptive therapy ON
+      f_ode.set_f_params(g_th, inter_mat, tr_th, d_th) #If therapy is ON, change growth rate/transition rate/add death rate
+      ts_therapy = np.append(ts_therapy, [True], axis=0) #Record therapy state
+      t_on = True
+    elif t_on and y_t.sum() < 0.1*K: #Threshold for adaptive therapy OFF
+      f_ode.set_f_params(g, inter_mat, tr, 0) #Therapy OFF
+      ts_therapy = np.append(ts_therapy, [False], axis=0) #Record therapy state
+      t_on = False
+    elif t_on and 0.1*K < y_t.sum() < 0.5*K: #If population size is in the window under therapy, therapy continues until 0.1*K
+      f_ode.set_f_params(g_th, inter_mat, tr_th, d_th) #If therapy is ON, change growth rate/transition rate/add death rate
+      ts_therapy = np.append(ts_therapy, [True], axis=0) #Record therapy state
+      t_on = True
+    else:
+      f_ode.set_f_params(g, inter_mat, tr, 0) #Therapy OFF
+      ts_therapy = np.append(ts_therapy, [False], axis=0)
+      t_on = False
+    # else:
+    #     f_ode.set_f_params(g, inter_mat, tr, 0) #Therapy OFF
+    #     ts_therapy = np.append(ts_therapy, [False], axis=0)
+    #     t_on = False
+
+    if (y_t < 0).any(): #If current time step gives negative value
+      y_t = np.where(y_t < 0, 0, y_t) #Reset that element to zero
+      f_ode.set_initial_value(y_t, f_ode.t) #Reinitialise setting negative element to zero
+    y = np.append(y, [y_t], axis=0)
+  
+  timeseries = y[:, 0] + y[:, 1]
+  period = r.return_freq(timeseries)
+  
+  y_ss = np.array([y[-1, 0], y[-1, 1]])
+  popsize_ss = y_ss.sum()
+  
+  return y_ss, run_params, period, popsize_ss, parms_array[-4:-2], parms_array[-2:]
+
+```
+
+
+```{python data-import}
+os.chdir('/home/vibishan/csb/adaptive-therapy-with-transitions/codes/numerical-sims/')
+t_span = np.arange(0, 5001)
+# ac_act_st1 = pd.read_excel('../../analysis/constant-dose/AC-ACT-st1.xlsx', names = ['ModelType', 'TGRatio', 'rx', 'ry', 'a', 'b', 'c', 'd', 'x0', 'y0', 'd_th', 'g_th', 'XFracBT', 'PopSizeBT', 'XFracAT', 'PopSizeAT'])
+# ac_act_st2 = pd.read_excel('../../analysis/constant-dose/AC-ACT-st2.xlsx', names = ['ModelType', 'TGRatio', 'rx', 'ry', 'a', 'b', 'c', 'd', 'x0', 'y0', 'd_th', 'g_th', 'XFracBT', 'PopSizeBT', 'XFracAT', 'PopSizeAT'])
+# ac_act_tx1 = pd.read_excel('../../analysis/constant-dose/AC-ACT-tx1.xlsx', names = ['ModelType', 'TGRatio', 'rx', 'ry', 'a', 'b', 'c', 'd', 'x0', 'y0', 'd_th', 'g_th', 'XFracBT', 'PopSizeBT', 'XFracAT', 'PopSizeAT'])
+ac_act_tx2 = pd.read_excel('../../analysis/constant-dose/AC-ACT-tx2.xlsx', names = ['ModelType', 'TGRatio', 'rx', 'ry', 'a', 'b', 'c', 'd', 'x0', 'y0', 'd_th', 'g_th', 'XFracBT', 'PopSizeBT', 'XFracAT', 'PopSizeAT'])
+
+# sc_sct_st1 = pd.read_excel('../../analysis/constant-dose/SC-SCT-st1.xlsx',
+#     names = ['ModelType', 'TGRatio', 'rx', 'ry', 'a', 'b', 'c', 'd', 'x0', 'y0', 'd_th', 'g_th', 'XFracBT', 'PopSizeBT', 'XFracAT', 'PopSizeAT'])
+# sc_sct_st2 = pd.read_excel('../../analysis/constant-dose/SC-SCT-st2.xlsx',
+#     names = ['ModelType', 'TGRatio', 'rx', 'ry', 'a', 'b', 'c', 'd', 'x0', 'y0', 'd_th', 'g_th', 'XFracBT', 'PopSizeBT', 'XFracAT', 'PopSizeAT'])
+# sc_sct_tx1 = pd.read_excel('../../analysis/constant-dose/SC-SCT-tx1.xlsx',
+#     names = ['ModelType', 'TGRatio', 'rx', 'ry', 'a', 'b', 'c', 'd', 'x0', 'y0', 'd_th', 'g_th', 'XFracBT', 'PopSizeBT', 'XFracAT', 'PopSizeAT'])
+sc_sct_tx2 = pd.read_excel('../../analysis/constant-dose/SC-SCT-tx2.xlsx', names = ['ModelType', 'TGRatio', 'rx', 'ry', 'a', 'b', 'c', 'd', 'x0', 'y0', 'd_th', 'g_th', 'XFracBT', 'PopSizeBT', 'XFracAT', 'PopSizeAT'])
+```
+
+```{python parameter-combinations}
+ac = ac_act_tx2[ac_act_tx2['ModelType'] == 'AC'].sample(n=10000)
+act = ac_act_tx2[ac_act_tx2['ModelType'] == 'ACT'].sample(n=10000)
+sc = sc_sct_tx2[sc_sct_tx2['ModelType'] == 'SC'].sample(n=10000)
+sct = sc_sct_tx2[sc_sct_tx2['ModelType'] == 'SCT'].sample(n=10000)
+
+ac_arr = ac.iloc[:, 2:].to_numpy()
+act_arr = act.iloc[:, 2:].to_numpy()
+sc_arr = sc.iloc[:, 2:].to_numpy()
+sct_arr = sct.iloc[:, 2:].to_numpy()
+
+parms_array = np.concatenate([ac_arr, act_arr, sc_arr, sct_arr])
+```
+
+```{python main-parallelizer}
+# Virtual cohort adaptive therapy
+if __name__ == '__main__':
+    __spec__ = "ModuleSpec(name='builtins', loader=<class '_frozen_importlib.BuiltinImporter'>)"
+    pool = Pool(10)
+    all_data = pool.map(sim_adaptive_therapy, parms_array) #iterate over combinations
+    pool.close()
+    pool.join()
+
+ss_cells = np.array([a[0] for a in all_data])
+# ts_therapy = np.array([a[1] for a in all_data])
+run_params = np.array([a[1] for a in all_data])
+period = np.array([a[2] for a in all_data])
+ss_popsize = np.array([a[3] for a in all_data])
+before_therapy = np.array([a[4] for a in all_data])
+after_cdt = np.array([a[5] for a in all_data])
+
+df_results = pd.DataFrame(run_params, columns=['r_x', 'r_y', 'a', 'b', 'c', 'd', 't_delay', 'g_scale', 'cell_death'])
+df_results.loc[:, 'ResFracBT'] = before_therapy[:, 0]
+df_results.loc[:, 'PopSizeBT'] = before_therapy[:, 1]
+df_results.loc[:, 'ResFracCDT'] = after_cdt[:, 0]
+df_results.loc[:, 'PopSizeCDT'] = after_cdt[:, 1]
+# df_results.loc[:, 'SenNumAT'] = ss_cells[:, 0]
+# df_results.loc[:, 'ResNumAT'] = ss_cells[:, 1]
+df_results.loc[:, 'ResFracAT'] = ss_cells[:, 1]/ss_cells.sum(axis=1)
+# df_results.loc[:, 'ResNumAT']/df_results.loc[:, 'SenNumAT':].sum(axis=1)
+df_results.loc[:, 'PeriodAT'] = period
+df_results.loc[:, 'PopSizeAT'] = ss_popsize
+df_results.to_csv('../../analysis/adaptive-therapy/virtual-cohort-cytotoxic-0.05-r3.csv')
+```
